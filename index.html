@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Runner 2D — Beer With Us</title>
+  <style>
+    :root { --bg:#0e1014; --fg:#e7f0ff; --accent:#6ee7ff; }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}
+    .wrap{display:grid;place-items:center;min-height:100%;gap:12px;padding:16px}
+    canvas{width:min(720px,95vw);height:calc(min(720px,95vw)*9/16);background:#111826;border:2px solid #1f2837;border-radius:16px;box-shadow:0 18px 60px rgba(0,0,0,.55)}
+    .hud{width:min(720px,95vw);display:flex;justify-content:space-between;align-items:center}
+    .btn{background:#1f2632;border:1px solid #2b3445;color:var(--fg);padding:8px 12px;border-radius:12px;cursor:pointer}
+    .btn:hover{border-color:var(--accent)}
+    .hint{opacity:.85;font-size:14px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game" width="960" height="540" aria-label="Jeu de saut et obstacles"></canvas>
+  <div class="hud">
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn" id="restart">Recommencer (R)</button>
+      <button class="btn" id="toggleTheme">Jour ↔ Nuit</button>
+    </div>
+    <div class="hint">Contrôles : <strong>Espace</strong> ou <strong>clic/tap</strong> pour sauter · <strong>R</strong> pour relancer</div>
+  </div>
+</div>
+
+<script>
+/* ===== Constantes ===== */
+const G = 1800, JUMP_V = 980, SPEED_BASE = 350, GROUND_Y = 400;
+/* Décalage vertical du joueur (négatif = plus haut, positif = plus bas) */
+let PLAYER_Y_OFFSET = 15; // ← règle ici
+
+/* spawn piloté par distance (densité constante vs vitesse) */
+const OBS_DIST_MIN = 420,  OBS_DIST_MAX = 720;    // bouteilles
+const GRASS_DIST_MIN = 120, GRASS_DIST_MAX = 240; // herbe
+
+/* ===== Canvas ===== */
+const canvas = document.getElementById('game');
+const c = canvas.getContext('2d');
+let last = 0;
+
+/* ===== Messages de fin ===== */
+const END_PHRASES = [
+  'Fail with us','Fail without us',
+  'Lose with us','Lose without us',
+  'Crash with us','Crash without us',
+  'Fall with us','Fall without us',
+  'Disappoint with us','Disappoint without us',
+  'Continue with us','Progress with us',
+  'Survive with us','Stay with us','Last with us'
+];
+
+/* ===== Etat ===== */
+const world = {
+  phase: 'start',             // 'start' | 'play' | 'gameover'
+  playing: false,
+  score: 0, best: Number(localStorage.getItem('bestScore')||0),
+  bgFarX: 0, bgNearX: 0,
+  distToNextObstacle: 0,
+  distToNextGrass: 0,
+  speedFactor: 0.5,           // 50% au départ
+  runTime: 0,
+  endMessage: 'Fail with us'
+};
+
+/* >>> player.y démarre avec l'offset */
+const player = { x:140, y:GROUND_Y + PLAYER_Y_OFFSET, w:90, h:110, vy:0, grounded:true };
+
+const spikes = []; const grasses = [];
+let DEBUG = false;
+const rand=(a,b)=>a+Math.random()*(b-a);
+
+/* Helpers distance spawn */
+function resetObstacleDistance(){ world.distToNextObstacle = rand(OBS_DIST_MIN, OBS_DIST_MAX); }
+function resetGrassDistance(){ world.distToNextGrass = rand(GRASS_DIST_MIN, GRASS_DIST_MAX); }
+
+/* ===== Fonds ===== */
+const DAY=new Image(), NIGHT=new Image();
+DAY.src='urban_day.png'; NIGHT.src='urban_night.png';
+function drawLayer(img, off){
+  const W=canvas.width; const x=((off%W)+W)%W;
+  c.drawImage(img,x-W,0,W,canvas.height);
+  c.drawImage(img,x,0,W,canvas.height);
+}
+
+/* ===== Guirlandes (midground) ===== */
+const MID_SIZE = { heightFactor: 0.6, yOffset: 0, widthFactor: 0.30 };
+const MID_DAY   = new Image();
+const MID_NIGHT = new Image();
+MID_DAY.src   = 'Flag_day.png';
+MID_NIGHT.src = 'Lights_night.png';
+MID_DAY.onload = MID_NIGHT.onload = () => mid.reset();
+
+let theme = 'day';
+const mid = {
+  strips: [],
+  get bandW() { return Math.max(1, Math.round(canvas.width * MID_SIZE.widthFactor)); },
+  get height(){ return Math.floor(canvas.height * MID_SIZE.heightFactor); },
+  get y(){ return Math.round(GROUND_Y + player.h - this.height + MID_SIZE.yOffset); },
+  img(){ return (theme === 'day') ? MID_DAY : MID_NIGHT; },
+  reset(){ this.strips.length = 0; },
+  ensureInit(){
+    const img = this.img();
+    if (!img || !img.complete || this.strips.length) return;
+    const W = this.bandW, tiles = Math.ceil(canvas.width / W) + 2, startX = -W;
+    this.strips = [];
+    for (let i=0;i<tiles;i++) this.strips.push({ x:startX + i*W });
+  },
+  update(dt, v){
+    this.ensureInit(); if (!this.strips.length) return;
+    for (const s of this.strips) s.x -= v * dt;
+    const W = this.bandW;
+    for (const s of this.strips){
+      if (s.x + W < 0){
+        const rightMost = Math.max(...this.strips.map(t=>t.x));
+        s.x = rightMost + W;
+      }
+    }
+  },
+  draw(ctx){
+    const img = this.img(); if (!img || !img.complete) return;
+    this.ensureInit();
+    const W = this.bandW, H = this.height, Y = this.y;
+    ctx.save(); ctx.imageSmoothingEnabled = false;
+    for (const s of this.strips) ctx.drawImage(img, s.x, Y, W, H);
+    ctx.restore();
+  }
+};
+
+/* ===== Pixel font ===== */
+const PIX = {
+  'A':["01110","10001","10001","11111","10001","10001","00000"],
+  'B':["11110","10001","11110","10001","10001","11110","00000"],
+  'C':["01111","10000","10000","10000","10000","01111","00000"],
+  'E':["11111","10000","11110","10000","10000","11111","00000"],
+  'F':["11111","10000","11110","10000","10000","10000","00000"],
+  'G':["01111","10000","10000","10111","10001","01111","00000"],
+  'H':["10001","10001","11111","10001","10001","10001","00000"],
+  'I':["11111","00100","00100","00100","00100","11111","00000"],
+  'L':["10000","10000","10000","10000","10000","11111","00000"],
+  'O':["01110","10001","10001","10001","10001","01110","00000"],
+  'P':["11110","10001","10001","11110","10000","10000","00000"],
+  'R':["11110","10001","11110","10100","10010","10001","00000"],
+  'S':["01111","10000","11110","00001","10001","01110","00000"],
+  'T':["11111","00100","00100","00100","00100","00100","00000"],
+  'U':["10001","10001","10001","10001","10001","11111","00000"],
+  'W':["10001","10001","10101","10101","11011","10001","00000"],
+  'Y':["10001","10001","01010","00100","00100","00100","00000"],
+  ' ':["00000","00000","00000","00000","00000","00000","00000"]
+};
+function textW(t,S){let w=0; for(const ch of t) w+=(ch===' '?3:5)+1; return w*S;}
+function pixText(ctx,t,x,y,S,col){
+  ctx.fillStyle=col; let cx=x;
+  for(const ch of t){
+    const g=PIX[ch]||PIX[' ']; const cw=(ch===' '?3:5);
+    for(let r=0;r<7;r++){
+      const row=g[r]||''.padEnd(cw,'0');
+      for(let k=0;k<cw;k++) if(row[k]==='1') ctx.fillRect(cx+k*S,y+r*S,S,S);
+    }
+    cx+=(cw+1)*S;
+  }
+}
+function drawLogo(){
+  const t = 'BEER WITH US', S = 5;
+  const col = (theme === 'night') ? '#E5CFC0' : '#000';
+  pixText(c, t, canvas.width - textW(t, S) - 12, 10, S, col);
+}
+
+/* ===== Joueur (jour/nuit) ===== */
+const gastonDay   = new Image();
+const gastonNight = new Image();
+gastonDay.src   = 'Gaston.png';
+gastonNight.src = 'Gaston_night.png';
+function drawPlayer(){
+  c.imageSmoothingEnabled = false;
+  const img = (theme === 'day') ? gastonDay : gastonNight;
+  if (img.complete && img.naturalWidth) {
+    c.drawImage(img, player.x, player.y, player.w, player.h);
+  } else {
+    c.fillStyle="#000";
+    c.fillRect(player.x+player.w*0.45, player.y+player.h*0.56, player.w*0.10, player.h*0.22);
+    c.fillRect(player.x+player.w*0.22, player.y+player.h*0.78, player.w*0.56, player.h*0.08);
+  }
+}
+
+/* ===== Collisions ===== */
+function ellipseRectOverlap(ex,ey,a,b, rx,ry,rw,rh){
+  const nx = Math.max(rx, Math.min(ex, rx+rw));
+  const ny = Math.max(ry, Math.min(ey, ry+rh));
+  const dx = (nx - ex) / a;
+  const dy = (ny - ey) / b;
+  return (dx*dx + dy*dy) <= 1;
+}
+function collidePlayerBottle(b){
+  const rx = player.w * 0.05, ry = player.h * 0.05;
+  const ex = player.x + player.w * 0.5, ey = player.y + player.h * 0.42;
+  const stemW = player.w * 0.1, stemH = player.h * 0.1;
+  const stemX = player.x + player.w * 0.45, stemY = player.y + player.h * 0.56;
+  if (ellipseRectOverlap(ex,ey,rx,ry, b.x,b.y,b.w,b.h)) return true;
+  if (stemX < b.x+b.w && stemX+stemW > b.x && stemY < b.y+b.h && stemY+stemH > b.y) return true;
+  return false;
+}
+
+/* ===== Sprites ===== */
+function drawBottleSprite(ctx,x,bottomY,w,h,labelColor='#FFB511'){
+  const glass='#8c5a2b', shadow='#6f4521';
+  const gx=12,gy=24, px=Math.max(1,Math.floor(Math.min(w/gx,h/gy)));
+  const drawW=px*gx, drawH=px*gy;
+  const left=Math.round(x+(w-drawW)/2), top=Math.round(bottomY-drawH);
+  const cell=(cx,cy,cw=1,ch=1,col)=>{ctx.fillStyle=col;ctx.fillRect(left+cx*px,top+cy*px,cw*px,ch*px);};
+  cell(3,20,6,4,shadow); cell(4,3,4,1,glass); cell(3,4,6,1,glass);
+  for(let yy=5;yy<=19;yy++) cell(3,yy,6,1,glass);
+  for(let yy=1;yy<=2;yy++) cell(5,yy,2,1,glass);
+  cell(4,0,4,2,labelColor);
+  for(let yy=5;yy<=19;yy++){cell(3,yy,1,1,shadow);cell(8,yy,1,1,shadow);}
+  cell(4,3,1,1,shadow); cell(7,3,1,1,shadow);
+  cell(3,10,6,8,labelColor);
+  cell(4,8,1,3,'#cfe8ff');
+}
+function spawnSpike(){
+  const palette=['#FFB511','#AC6F42','#00BA6E','#5B8EDB','#F16AB7','#FF6C2F','#E74536','#936DB7'];
+  const h=Math.round(rand(144,224)*0.72), w=Math.round(h*0.6);
+  const color=palette[Math.floor(Math.random()*palette.length)];
+  spikes.push({x:canvas.width+w,y:GROUND_Y+(player.h-h),w,h,labelColor:color});
+}
+function spawnGrass(x){ const w=Math.round(rand(20,50)), h=Math.round(rand(10,30)); grasses.push({x:(typeof x==='number')?x:canvas.width+w, baseY:GROUND_Y+player.h, w, h}); }
+function drawGrassSprite(ctx,x,baseY,w,h){
+  const gx=Math.max(1,Math.floor(w/6)), gh=Math.max(1,Math.floor(h/6)), y=Math.round(baseY), left=Math.round(x);
+  const a='#2e7d32', b='#66bb6a';
+  ctx.fillStyle=a; ctx.fillRect(left,y-h,gx*2,h);
+  ctx.fillStyle=b; ctx.fillRect(left+gx*2,y-Math.round(h*.8),gx*2,Math.round(h*.8));
+  ctx.fillStyle=a; ctx.fillRect(left+gx*4,y-Math.round(h*.9),gx*2,Math.round(h*.9));
+  ctx.fillRect(left+gx,y-h-gh,gx,gh); ctx.fillRect(left+gx*3,y-Math.round(h*.8)-gh,gx,gh);
+  ctx.fillRect(left+gx*5,y-Math.round(h*.9)-gh,gx,gh);
+}
+
+/* ===== START OVERLAY (bouton neo-2D) ===== */
+const startBtn = {x:0,y:0,w:0,h:0, visible:false};
+function drawStartOverlay(){
+  c.save();
+  c.fillStyle='rgba(0,0,0,0.25)';
+  c.fillRect(0,0,canvas.width,canvas.height);
+
+  const btnW = Math.min(520, Math.floor(canvas.width*0.75));
+  const btnH = 180;
+  const btnX = Math.floor((canvas.width - btnW)/2);
+  const btnY = Math.floor((canvas.height - btnH)/2);
+  startBtn.x=btnX; startBtn.y=btnY; startBtn.w=btnW; startBtn.h=btnH; startBtn.visible=true;
+
+  c.fillStyle='rgba(0,0,0,0.35)'; c.fillRect(btnX+8,btnY+10,btnW,btnH);
+  c.fillStyle='#E5CFC0'; c.fillRect(btnX,btnY,btnW,btnH);
+  c.fillStyle='rgba(255,255,255,0.55)'; c.fillRect(btnX,btnY,btnW,6); c.fillRect(btnX,btnY,6,btnH);
+  c.fillStyle='rgba(0,0,0,0.25)';      c.fillRect(btnX,btnY+btnH-6,btnW,6); c.fillRect(btnX+btnW-6,btnY,6,btnH);
+
+  const line1='PLAY WITH US';
+  const line2="BRASSERIE DOCTEUR GAB'S";
+  const S=4;
+  const ty = btnY + Math.floor((btnH - (7*S + 10 + 22)) / 2);
+  const tx1 = btnX + Math.floor((btnW - textW(line1,S)) / 2);
+  pixText(c, line1, tx1, ty, S, '#000');
+
+  c.font='bold 22px system-ui, sans-serif';
+  c.fillStyle='#000'; c.textAlign='center';
+  c.fillText(line2, btnX + btnW/2, ty + 7*S + 20);
+
+  c.font='italic 16px system-ui, sans-serif';
+  c.fillText('Espace / clic pour jouer', canvas.width/2, btnY+btnH+14);
+  c.restore();
+}
+
+/* ===== Input ===== */
+function startGame(){
+  if (world.phase==='play') return;
+  world.phase='play';
+  world.playing=true;
+  world.runTime=0;
+  world.speedFactor=0.5;
+  world.score=0;
+  // >>> reset avec offset
+  player.y = GROUND_Y + PLAYER_Y_OFFSET; player.vy=0; player.grounded=true;
+  spikes.length=0; grasses.length=0;
+  resetObstacleDistance(); resetGrassDistance();
+}
+function doJump(){
+  if(world.phase!=='play'){ startGame(); return; }
+  if(player.grounded){ player.vy=-JUMP_V; player.grounded=false; }
+}
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){ e.preventDefault(); doJump(); }
+  if(e.key.toLowerCase()==='r'){ startGame(); }
+});
+document.getElementById('restart').addEventListener('click', startGame);
+document.getElementById('toggleTheme').addEventListener('click',()=>{
+  theme=(theme==='day')?'night':'day';
+  mid.reset();
+});
+canvas.addEventListener('pointerdown',(e)=>{
+  const rect=canvas.getBoundingClientRect();
+  const x=(e.clientX-rect.left)*(canvas.width/rect.width);
+  const y=(e.clientY-rect.top )*(canvas.height/rect.height);
+  if(world.phase!=='play'){
+    if(startBtn.visible && x>=startBtn.x && x<=startBtn.x+startBtn.w && y>=startBtn.y && y<=startBtn.y+startBtn.h){ startGame(); return; }
+    startGame(); return;
+  }
+  doJump();
+});
+
+/* ===== Helper pour régler en live depuis la console ===== */
+function setPlayerYOffset(px){
+  PLAYER_Y_OFFSET = px|0;
+  if (player.grounded) player.y = GROUND_Y + PLAYER_Y_OFFSET;
+}
+
+/* ===== Reset utilitaire ===== */
+function reset(){
+  world.phase='play'; world.playing=true; world.score=0;
+  // >>> reset avec offset
+  player.y = GROUND_Y + PLAYER_Y_OFFSET; player.vy=0; player.grounded=true;
+  spikes.length=0; grasses.length=0; world.bgFarX=0; world.bgNearX=0;
+  world.speedFactor=0.5; world.runTime=0; world.endMessage='Fail with us';
+  resetObstacleDistance(); resetGrassDistance();
+  for(let i=0;i<6;i++) spawnGrass(rand(0,canvas.width));
+  mid.reset();
+}
+
+/* ===== Boucle ===== */
+requestAnimationFrame(loop);
+function loop(ts){ const dt=Math.min(0.033,(ts-last)/1000||0); last=ts; update(dt); draw(); requestAnimationFrame(loop); }
+
+/* ===== Update/Draw ===== */
+function update(dt){
+  if (world.phase!=='play' || !world.playing) return;
+
+  // Accélération linéaire 0.5x -> 2.0x en ~75s
+  world.runTime += dt;
+  const RAMP_DURATION=75, START=0.5, END=2.0;
+  const t = Math.min(world.runTime / RAMP_DURATION, 1);
+  world.speedFactor = START + (END-START)*t;
+
+  const speed = SPEED_BASE * world.speedFactor;
+  const W=canvas.width;
+  world.bgFarX  = (world.bgFarX  - speed*.06 *dt) % W;
+  world.bgNearX = (world.bgNearX - speed*.12 *dt) % W;
+  mid.update(dt, speed*0.8);
+
+  // Physique joueur (avec sol à GROUND_Y + offset)
+  player.vy+=G*dt; player.y+=player.vy*dt;
+  if(player.y>=GROUND_Y + PLAYER_Y_OFFSET){
+    player.y = GROUND_Y + PLAYER_Y_OFFSET;
+    player.vy=0; player.grounded=true;
+  }
+
+  // Spawn par distance
+  world.distToNextObstacle -= speed * dt;
+  if (world.distToNextObstacle <= 0){ spawnSpike(); resetObstacleDistance(); }
+
+  const grassSpeed = speed*1.15;
+  world.distToNextGrass -= grassSpeed * dt;
+  if (world.distToNextGrass <= 0){ spawnGrass(); resetGrassDistance(); }
+
+  // Déplacements & scoring
+  for(let i=spikes.length-1;i>=0;i--){ const s=spikes[i]; s.x-=speed*dt; if(s.x+s.w<0){ spikes.splice(i,1); world.score++; } }
+  for(let i=grasses.length-1;i>=0;i--){ const g=grasses[i]; g.x-=grassSpeed*dt; if(g.x+g.w<0) grasses.splice(i,1); }
+
+  // Collisions
+  for(const s of spikes){
+    if(collidePlayerBottle(s)){
+      world.playing=false;
+      world.phase='gameover';
+      world.best=Math.max(world.best,world.score);
+      localStorage.setItem('bestScore',world.best);
+      world.endMessage = END_PHRASES[Math.floor(Math.random()*END_PHRASES.length)];
+      break;
+    }
+  }
+}
+
+function draw(){
+  c.clearRect(0,0,canvas.width,canvas.height);
+
+  const bg=(theme==='day')?DAY:NIGHT;
+  if(bg.complete&&bg.naturalWidth>0){ drawLayer(bg,world.bgFarX); drawLayer(bg,world.bgNearX); }
+  else { c.fillStyle='#0f141d'; c.fillRect(0,0,canvas.width,canvas.height); }
+
+  mid.draw(c);
+  c.fillStyle='#1e2836'; c.fillRect(0,GROUND_Y+player.h,canvas.width,999);
+  c.fillStyle='#2a3649'; c.fillRect(0,GROUND_Y+player.h,canvas.width,6);
+
+  drawLogo(); drawPlayer();
+  for(const s of spikes) drawBottleSprite(c,s.x,s.y+s.h,s.w,s.h,s.labelColor);
+  for(const g of grasses) drawGrassSprite(c,g.x,g.baseY,g.w,g.h);
+  c.font='20px system-ui,sans-serif'; c.textBaseline='top'; c.fillStyle='rgba(255,255,255,.9)';
+  c.fillText(`Score: ${world.score}`,20,16); c.fillText(`Best: ${world.best}`,20,42);
+
+  if (world.phase==='start'){ drawStartOverlay(); return; }
+  if (world.phase==='gameover'){
+    c.save();
+    c.fillStyle='rgba(0,0,0,0.45)'; c.fillRect(0,0,canvas.width,canvas.height);
+    const title = world.endMessage, color = '#E5CFC0', fs = Math.floor(canvas.width*0.09);
+    c.textAlign='center'; c.textBaseline='middle';
+    c.font=`800 ${fs}px system-ui, sans-serif`;
+    c.fillStyle='rgba(0,0,0,.6)'; c.fillText(title, canvas.width/2, canvas.height/2 - fs*0.1 + 4);
+    c.fillStyle=color; c.fillText(title, canvas.width/2, canvas.height/2 - fs*0.1);
+    c.font=`500 ${Math.floor(fs*0.35)}px system-ui, sans-serif`;
+    c.fillStyle='rgba(255,255,255,.9)';
+    c.fillText('Espace / clic pour rejouer · R pour relancer', canvas.width/2, canvas.height/2 + fs*0.6);
+    c.restore();
+  }
+}
+</script>
+</body>
+</html>
