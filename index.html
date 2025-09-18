@@ -3,233 +3,294 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Runner 2D — Beer With Us</title>
+  <title>Runner 2D — Beer With Us (amélioré)</title>
   <style>
     :root { --bg:#0e1014; --fg:#e7f0ff; --accent:#6ee7ff; }
     *{box-sizing:border-box}
     html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}
     .wrap{display:grid;place-items:center;min-height:100%;gap:12px;padding:16px}
-    canvas{width:min(720px,95vw);height:calc(min(720px,95vw)*9/16);background:#111826;border:2px solid #1f2837;border-radius:16px;box-shadow:0 18px 60px rgba(0,0,0,.55)}
+    canvas{width:min(720px,95vw);height:calc(min(720px,95vw)*9/16);background:#111826;border:2px solid #1f2837;border-radius:16px;box-shadow:0 18px 60px rgba(0,0,0,.55);outline:none}
     .hud{width:min(720px,95vw);display:flex;justify-content:space-between;align-items:center}
     .btn{background:#1f2632;border:1px solid #2b3445;color:var(--fg);padding:8px 12px;border-radius:12px;cursor:pointer}
     .btn:hover{border-color:var(--accent)}
     .hint{opacity:.85;font-size:14px}
+    .sr-only{position:absolute;left:-10000px;top:auto;width:1px;height:1px;overflow:hidden}
   </style>
 </head>
 <body>
 <div class="wrap">
-  <canvas id="game" width="960" height="540" aria-label="Jeu de saut et obstacles"></canvas>
+  <canvas id="game" width="960" height="540" aria-label="Jeu de saut et obstacles" tabindex="0"></canvas>
+  <div id="ariaHud" class="sr-only" aria-live="polite"></div>
   <div class="hud">
     <div style="display:flex;gap:8px;align-items:center">
       <button class="btn" id="restart">Recommencer (R)</button>
       <button class="btn" id="toggleTheme">Jour ↔ Nuit</button>
+      <button class="btn" id="pauseBtn">Pause (P)</button>
+      <button class="btn" id="muteBtn">🔇 Son (M)</button>
     </div>
-    <div class="hint">Contrôles : <strong>Espace</strong> ou <strong>clic/tap</strong> pour sauter · <strong>R</strong> pour relancer</div>
+    <div class="hint">Contrôles : <strong>Espace</strong> / <strong>clic</strong> pour sauter · <strong>R</strong> relancer · <strong>P</strong> pause</div>
   </div>
 </div>
 
 <script>
-/* ===== Constantes ===== */
-const G = 1800, JUMP_V = 980, SPEED_BASE = 350, GROUND_Y = 400;
-/* Décalage vertical du joueur (négatif = plus haut, positif = plus bas) */
-let PLAYER_Y_OFFSET = 15; // ← règle ici
+/* ===== Constantes globales (espace logique 960×540) ===== */
+const LOGICAL_W = 960, LOGICAL_H = 540;
+const GROUND_Y = 400;
+const SPEED_BASE = 250;
 
-/* spawn piloté par distance (densité constante vs vitesse) */
-const OBS_DIST_MIN = 420,  OBS_DIST_MAX = 720;    // bouteilles
-const GRASS_DIST_MIN = 120, GRASS_DIST_MAX = 240; // herbe
+/* Saut variable + DOUBLE SAUT (+ coyote/buffer pour le 1er) */
+const JUMP_V  = 300;
+const JUMP_V2 = 250;
+const MAX_JUMPS = 2;
+const JUMP_HOLD_ACCEL = 3000;
+const JUMP_HOLD_MAX   = 0.30;
+const G_ASCEND   = 1800;
+const G_DESCEND  = 1200;
+const VY_FALL_CAP = 1400;
+const COYOTE_TIME = 0.08;
+const JUMP_BUFFER = 0.10;
 
-/* ===== Canvas ===== */
+/* Décalage vertical du joueur */
+let PLAYER_Y_OFFSET = 15;
+
+/* Distances */
+const BOTTLE_DIST = { min: 420, max: 720 };
+const KEG_DIST    = { min: 700, max: 1200 };
+const GRASS_DIST_MIN = 120, GRASS_DIST_MAX = 240;
+const GRASS_Y_OFFSET = 0;
+const GRASS_H_MIN = 14, GRASS_H_MAX = 28;
+
+/* Fûts */
+const KEG_PROBABILITY = 0.25;
+const KEG_AFTER_SECONDS = 10;
+
+/* Capsules volantes */
+const FLY_AFTER_SECONDS = 15;
+const FLY_DIST_MIN = 700, FLY_DIST_MAX = 1400;
+const FLY_ALT_MIN = 400, FLY_ALT_MAX = 500;
+const CAP_RADIUS_MIN = 16, CAP_RADIUS_MAX = 24;
+const CAP_SPIN_RANGE = [6, 10];
+const CAP_OMEGA_RANGE = [1.2, 1.8];
+const CAP_AMP_RANGE   = [22, 42];
+const CAP_VX_FACTOR   = [0.95, 1.25];
+
+/* Couleurs */
+const LABEL_PALETTE = ['#FFB511','#AC6F42','#00BA6E','#5B8EDB','#F16AB7','#FF6C2F','#E74536','#936DB7'];
+
+/* ===== Canvas (HiDPI) ===== */
 const canvas = document.getElementById('game');
 const c = canvas.getContext('2d');
-let last = 0;
+let dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+function resizeCanvasForHiDPI(){
+  dpr = Math.max(1, Math.floor(window.devicePixelRatio || 1));
+  canvas.width  = LOGICAL_W * dpr;
+  canvas.height = LOGICAL_H * dpr;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resizeCanvasForHiDPI();
+window.addEventListener('resize', resizeCanvasForHiDPI);
 
-/* ===== Messages de fin ===== */
-const END_PHRASES = [
-  'Fail with us','Fail without us',
-  'Lose with us','Lose without us',
-  'Crash with us','Crash without us',
-  'Fall with us','Fall without us',
-  'Disappoint with us','Disappoint without us',
-  'Continue with us','Progress with us',
-  'Survive with us','Stay with us','Last with us'
-];
+let last = 0;
 
 /* ===== Etat ===== */
 const world = {
-  phase: 'start',             // 'start' | 'play' | 'gameover'
-  playing: false,
-  score: 0, best: Number(localStorage.getItem('bestScore')||0),
-  bgFarX: 0, bgNearX: 0,
-  distToNextObstacle: 0,
-  distToNextGrass: 0,
-  speedFactor: 0.5,           // 50% au départ
-  runTime: 0,
-  endMessage: 'Fail with us'
+  phase:'start',
+  playing:false,
+  paused:false,
+  score:0, best:Number(localStorage.getItem('bestScore')||0),
+  bgFarX:0, bgNearX:0,
+  distToNextObstacle:0, distToNextGrass:0, distToNextFly:0,
+  speedFactor:0.6,
+  runTime:0,
+  endMessage:'Fail with us',
+  muted:true
 };
 
-/* >>> player.y démarre avec l'offset */
-const player = { x:140, y:GROUND_Y + PLAYER_Y_OFFSET, w:90, h:110, vy:0, grounded:true };
+const player = { x:140, y:GROUND_Y+PLAYER_Y_OFFSET, w:90, h:110, vy:0, grounded:true };
+let jumpHeld=false, jumpHoldT=0;
+let jumpsUsed = 0;
+let coyoteT = 0, jumpBufferT = 0;
 
-const spikes = []; const grasses = [];
-let DEBUG = false;
+/* Collections */
+const spikes=[], flyers=[], grasses=[];
 const rand=(a,b)=>a+Math.random()*(b-a);
 
-/* Helpers distance spawn */
-function resetObstacleDistance(){ world.distToNextObstacle = rand(OBS_DIST_MIN, OBS_DIST_MAX); }
+/* Helpers distances */
+function resetObstacleDistance(nextKind){
+  const r = nextKind === 'keg' ? KEG_DIST : BOTTLE_DIST;
+  world.distToNextObstacle = rand(r.min, r.max);
+}
 function resetGrassDistance(){ world.distToNextGrass = rand(GRASS_DIST_MIN, GRASS_DIST_MAX); }
+function resetFlyDistance(){ world.distToNextFly = rand(FLY_DIST_MIN, FLY_DIST_MAX); }
 
 /* ===== Fonds ===== */
 const DAY=new Image(), NIGHT=new Image();
 DAY.src='urban_day.png'; NIGHT.src='urban_night.png';
 function drawLayer(img, off){
-  const W=canvas.width; const x=((off%W)+W)%W;
-  c.drawImage(img,x-W,0,W,canvas.height);
-  c.drawImage(img,x,0,W,canvas.height);
+  const W=LOGICAL_W; const x=((off%W)+W)%W;
+  c.drawImage(img,x-W,0,LOGICAL_W,LOGICAL_H);
+  c.drawImage(img,x,0,LOGICAL_W,LOGICAL_H);
 }
-
-/* ===== Guirlandes (midground) ===== */
 const MID_SIZE = { heightFactor: 0.6, yOffset: 0, widthFactor: 0.30 };
-const MID_DAY   = new Image();
-const MID_NIGHT = new Image();
-MID_DAY.src   = 'Flag_day.png';
-MID_NIGHT.src = 'Lights_night.png';
-MID_DAY.onload = MID_NIGHT.onload = () => mid.reset();
+const MID_DAY=new Image(), MID_NIGHT=new Image();
+MID_DAY.src='Flag_day.png'; MID_NIGHT.src='Lights_night.png';
+let theme='day';
+const mid={
+  strips:[],
+  get bandW(){return Math.max(1,Math.round(LOGICAL_W*MID_SIZE.widthFactor));},
+  get height(){return Math.floor(LOGICAL_H*MID_SIZE.heightFactor);},
+  get y(){return Math.round(GROUND_Y+player.h-this.height+MID_SIZE.yOffset);},
+  img(){return theme==='day'?MID_DAY:MID_NIGHT;},
+  reset(){this.strips.length=0;},
+  ensureInit(){const img=this.img(); if(!img||!img.complete||this.strips.length)return;
+    const W=this.bandW, tiles=Math.ceil(LOGICAL_W/W)+2, startX=-W;
+    this.strips=[]; for(let i=0;i<tiles;i++) this.strips.push({x:startX+i*W});},
+  update(dt,v){this.ensureInit(); if(!this.strips.length)return;
+    for(const s of this.strips) s.x-=v*dt;
+    const W=this.bandW; for(const s of this.strips){ if(s.x+W<0){ const r=Math.max(...this.strips.map(t=>t.x)); s.x=r+W; } } },
+  draw(ctx){const img=this.img(); if(!img||!img.complete)return; this.ensureInit();
+    const W=this.bandW,H=this.height,Y=this.y; ctx.save(); ctx.imageSmoothingEnabled=false;
+    for(const s of this.strips) ctx.drawImage(img,s.x,Y,W,H); ctx.restore();}
+};
 
-let theme = 'day';
-const mid = {
+/* ===== Couche "field" ===== */
+const FIELD_DAY   = new Image();
+const FIELD_NIGHT = new Image();
+FIELD_DAY.src   = 'field_day.png';
+FIELD_NIGHT.src = 'field_night.png';
+
+const FIELD_SIZE = { widthFactor: 0.4, heightFactor: 0.42 };
+const FIELD_Y_PCT = 0.55;
+
+const field = {
   strips: [],
-  get bandW() { return Math.max(1, Math.round(canvas.width * MID_SIZE.widthFactor)); },
-  get height(){ return Math.floor(canvas.height * MID_SIZE.heightFactor); },
-  get y(){ return Math.round(GROUND_Y + player.h - this.height + MID_SIZE.yOffset); },
-  img(){ return (theme === 'day') ? MID_DAY : MID_NIGHT; },
-  reset(){ this.strips.length = 0; },
+  get bandW()  { return Math.max(1, Math.round(LOGICAL_W * FIELD_SIZE.widthFactor)); },
+  get height() { return Math.floor(LOGICAL_H * FIELD_SIZE.heightFactor); },
+  get y()      { return Math.round(LOGICAL_H * FIELD_Y_PCT); },
+  img()        { return (theme === 'day') ? FIELD_DAY : FIELD_NIGHT; },
+  reset()      { this.strips.length = 0; },
   ensureInit(){
-    const img = this.img();
-    if (!img || !img.complete || this.strips.length) return;
-    const W = this.bandW, tiles = Math.ceil(canvas.width / W) + 2, startX = -W;
-    this.strips = [];
-    for (let i=0;i<tiles;i++) this.strips.push({ x:startX + i*W });
+    const img = this.img(); if (!img || !img.complete || this.strips.length) return;
+    const W = this.bandW, tiles = Math.ceil(LOGICAL_W / W) + 2, startX = -W;
+    this.strips = []; for (let i = 0; i < tiles; i++) this.strips.push({ x: startX + i * W });
   },
   update(dt, v){
     this.ensureInit(); if (!this.strips.length) return;
     for (const s of this.strips) s.x -= v * dt;
     const W = this.bandW;
-    for (const s of this.strips){
-      if (s.x + W < 0){
-        const rightMost = Math.max(...this.strips.map(t=>t.x));
-        s.x = rightMost + W;
-      }
-    }
+    for (const s of this.strips){ if (s.x + W < 0){ const rightMost = Math.max(...this.strips.map(t => t.x)); s.x = rightMost + W; } }
   },
   draw(ctx){
-    const img = this.img(); if (!img || !img.complete) return;
-    this.ensureInit();
+    const img = this.img(); this.ensureInit();
     const W = this.bandW, H = this.height, Y = this.y;
-    ctx.save(); ctx.imageSmoothingEnabled = false;
-    for (const s of this.strips) ctx.drawImage(img, s.x, Y, W, H);
+    if (img && img.complete && img.naturalWidth){
+      ctx.save(); ctx.imageSmoothingEnabled = false;
+      for (const s of this.strips) ctx.drawImage(img, s.x, Y, W, H);
+      ctx.restore(); return;
+    }
+    // Placeholder vectoriel
+    ctx.save(); ctx.globalAlpha = (theme === 'day') ? 0.9 : 0.7;
+    for (const s of this.strips){
+      ctx.fillStyle = (theme === 'day') ? '#d4a017' : '#2a3e55';
+      ctx.fillRect(Math.round(s.x), Y + Math.round(H*0.75), W, Math.max(3, Math.round(H*0.03)));
+      const n = 8, step = W / n;
+      for (let i = 0; i < n; i++){
+        const x = Math.round(s.x + i * step + 6);
+        const stemH = Math.round(H*0.35) + (i % 3) * 8;
+        ctx.strokeStyle = (theme === 'day') ? '#e5c35a' : '#5e7896';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x, Y + Math.round(H*0.75));
+        ctx.lineTo(x, Y + Math.round(H*0.75) - stemH); ctx.stroke();
+        ctx.fillStyle = (theme === 'day') ? '#f5d67a' : '#8aa2bf';
+        ctx.beginPath();
+        const tipY = Y + Math.round(H*0.75) - stemH;
+        ctx.moveTo(x-3, tipY); ctx.lineTo(x, tipY-6); ctx.lineTo(x+3, tipY);
+        ctx.closePath(); ctx.fill();
+      }
+    }
     ctx.restore();
   }
 };
 
-/* ===== Pixel font ===== */
-const PIX = {
-  'A':["01110","10001","10001","11111","10001","10001","00000"],
-  'B':["11110","10001","11110","10001","10001","11110","00000"],
-  'C':["01111","10000","10000","10000","10000","01111","00000"],
-  'E':["11111","10000","11110","10000","10000","11111","00000"],
-  'F':["11111","10000","11110","10000","10000","10000","00000"],
-  'G':["01111","10000","10000","10111","10001","01111","00000"],
-  'H':["10001","10001","11111","10001","10001","10001","00000"],
-  'I':["11111","00100","00100","00100","00100","11111","00000"],
-  'L':["10000","10000","10000","10000","10000","11111","00000"],
-  'O':["01110","10001","10001","10001","10001","01110","00000"],
-  'P':["11110","10001","10001","11110","10000","10000","00000"],
-  'R':["11110","10001","11110","10100","10010","10001","00000"],
-  'S':["01111","10000","11110","00001","10001","01110","00000"],
-  'T':["11111","00100","00100","00100","00100","00100","00000"],
-  'U':["10001","10001","10001","10001","10001","11111","00000"],
-  'W':["10001","10001","10101","10101","11011","10001","00000"],
-  'Y':["10001","10001","01010","00100","00100","00100","00000"],
-  ' ':["00000","00000","00000","00000","00000","00000","00000"]
-};
+/* ===== Pixel font & logo ===== */
+const PIX={'A':["01110","10001","10001","11111","10001","10001","00000"],'B':["11110","10001","11110","10001","10001","11110","00000"],'C':["01111","10000","10000","10000","10000","01111","00000"],'E':["11111","10000","11110","10000","10000","11111","00000"],'F':["11111","10000","11110","10000","10000","10000","00000"],'G':["01111","10000","10000","10111","10001","01111","00000"],'H':["10001","10001","11111","10001","10001","10001","00000"],'I':["11111","00100","00100","00100","00100","11111","00000"],'L':["10000","10000","10000","10000","10000","11111","00000"],'O':["01110","10001","10001","10001","10001","01110","00000"],'P':["11110","10001","10001","11110","10000","10000","00000"],'R':["11110","10001","11110","10100","10010","10001","00000"],'S':["01111","10000","11110","00001","10001","01110","00000"],'T':["11111","00100","00100","00100","00100","00100","00000"],'U':["10001","10001","10001","10001","10001","11111","00000"],'W':["10001","10001","10101","10101","11011","10001","00000"],'Y':["10001","10001","01010","00100","00100","00100","00000"],' ':["00000","00000","00000","00000","00000","00000","00000"]};
 function textW(t,S){let w=0; for(const ch of t) w+=(ch===' '?3:5)+1; return w*S;}
-function pixText(ctx,t,x,y,S,col){
-  ctx.fillStyle=col; let cx=x;
-  for(const ch of t){
-    const g=PIX[ch]||PIX[' ']; const cw=(ch===' '?3:5);
-    for(let r=0;r<7;r++){
-      const row=g[r]||''.padEnd(cw,'0');
-      for(let k=0;k<cw;k++) if(row[k]==='1') ctx.fillRect(cx+k*S,y+r*S,S,S);
-    }
-    cx+=(cw+1)*S;
-  }
-}
-function drawLogo(){
-  const t = 'BEER WITH US', S = 5;
-  const col = (theme === 'night') ? '#E5CFC0' : '#000';
-  pixText(c, t, canvas.width - textW(t, S) - 12, 10, S, col);
-}
+function pixText(ctx,t,x,y,S,col){ctx.fillStyle=col; let cx=x; for(const ch of t){const g=PIX[ch]||PIX[' ']; const cw=(ch===' '?3:5);
+  for(let r=0;r<7;r++){const row=g[r]||''.padEnd(cw,'0'); for(let k=0;k<cw;k++) if(row[k]==='1') ctx.fillRect(cx+k*S,y+r*S,S,S);} cx+=(cw+1)*S;}}
+function drawLogo(){const t='BEER WITH US',S=5,col=(theme==='night')?'#E5CFC0':'#000'; pixText(c,t,LOGICAL_W-textW(t,S)-12,10,S,col);} 
 
-/* ===== Joueur (jour/nuit) ===== */
-const gastonDay   = new Image();
-const gastonNight = new Image();
-gastonDay.src   = 'Gaston.png';
-gastonNight.src = 'Gaston_night.png';
-function drawPlayer(){
-  c.imageSmoothingEnabled = false;
-  const img = (theme === 'day') ? gastonDay : gastonNight;
-  if (img.complete && img.naturalWidth) {
-    c.drawImage(img, player.x, player.y, player.w, player.h);
-  } else {
-    c.fillStyle="#000";
-    c.fillRect(player.x+player.w*0.45, player.y+player.h*0.56, player.w*0.10, player.h*0.22);
-    c.fillRect(player.x+player.w*0.22, player.y+player.h*0.78, player.w*0.56, player.h*0.08);
-  }
-}
+/* ===== Joueur (sprites) ===== */
+const gastonDay=new Image(), gastonNight=new Image();
+gastonDay.src='Gaston.png'; gastonNight.src='Gaston_night.png';
+function drawPlayer(){c.imageSmoothingEnabled=false; const img=(theme==='day')?gastonDay:gastonNight;
+  if(img.complete&&img.naturalWidth) c.drawImage(img,player.x,player.y,player.w,player.h);
+  else{ c.fillStyle="#000"; c.fillRect(player.x+player.w*0.45, player.y+player.h*0.56, player.w*0.10, player.h*0.22);
+        c.fillRect(player.x+player.w*0.22, player.y+player.h*0.78, player.w*0.56, player.h*0.08); } }
 
 /* ===== Collisions ===== */
+function rectOverlap(ax,ay,aw,ah,bx,by,bw,bh){return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by;}
 function ellipseRectOverlap(ex,ey,a,b, rx,ry,rw,rh){
-  const nx = Math.max(rx, Math.min(ex, rx+rw));
-  const ny = Math.max(ry, Math.min(ey, ry+rh));
-  const dx = (nx - ex) / a;
-  const dy = (ny - ey) / b;
-  return (dx*dx + dy*dy) <= 1;
+  const nx=Math.max(rx,Math.min(ex,rx+rw)), ny=Math.max(ry,Math.min(ey,ry+rh));
+  const dx=(nx-ex)/a, dy=(ny-ey)/b; return (dx*dx+dy*dy)<=1;
 }
 function collidePlayerBottle(b){
-  const rx = player.w * 0.05, ry = player.h * 0.05;
-  const ex = player.x + player.w * 0.5, ey = player.y + player.h * 0.42;
-  const stemW = player.w * 0.1, stemH = player.h * 0.1;
-  const stemX = player.x + player.w * 0.45, stemY = player.y + player.h * 0.56;
-  if (ellipseRectOverlap(ex,ey,rx,ry, b.x,b.y,b.w,b.h)) return true;
-  if (stemX < b.x+b.w && stemX+stemW > b.x && stemY < b.y+b.h && stemY+stemH > b.y) return true;
+  const rx=player.w*0.05, ry=player.h*0.05;
+  const ex=player.x+player.w*0.5, ey=player.y+player.h*0.42;
+  const stemW=player.w*0.1, stemH=player.h*0.1, stemX=player.x+player.w*0.45, stemY=player.y+player.h*0.56;
+  if(ellipseRectOverlap(ex,ey,rx,ry, b.x,b.y,b.w,b.h)) return true;
+  if(rectOverlap(stemX,stemY,stemW,stemH, b.x,b.y,b.w,b.h)) return true;
   return false;
 }
+function collidePlayerKeg(k){ return rectOverlap(player.x,player.y,player.w,player.h,k.x,k.y,k.w,k.h); }
 
-/* ===== Sprites ===== */
+/* --- Capsule ↔ joueur : hitbox "bol" pour éviter les faux positifs --- */
+const PLAYER_AIR_HITBOX = { x:0.20, y:0.08, w:0.60, h:0.55, capShrink:0.90 };
+// x,y,w,h = fractions de player.w / player.h
+function circleRectOverlap(cx, cy, r, rx, ry, rw, rh){
+  const nx = Math.max(rx, Math.min(cx, rx + rw));
+  const ny = Math.max(ry, Math.min(cy, ry + rh));
+  const dx = nx - cx, dy = ny - cy;
+  return (dx*dx + dy*dy) <= r*r;
+}
+
+/* ===== Bouteille (sprite pixel) ===== */
 function drawBottleSprite(ctx,x,bottomY,w,h,labelColor='#FFB511'){
-  const glass='#8c5a2b', shadow='#6f4521';
-  const gx=12,gy=24, px=Math.max(1,Math.floor(Math.min(w/gx,h/gy)));
-  const drawW=px*gx, drawH=px*gy;
-  const left=Math.round(x+(w-drawW)/2), top=Math.round(bottomY-drawH);
+  const glass='#8c5a2b', shadow='#6f4521', gx=12,gy=24;
+  const px=Math.max(1,Math.floor(Math.min(w/gx,h/gy)));
+  const drawW=px*gx, drawH=px*gy, left=Math.round(x+(w-drawW)/2), top=Math.round(bottomY-drawH);
   const cell=(cx,cy,cw=1,ch=1,col)=>{ctx.fillStyle=col;ctx.fillRect(left+cx*px,top+cy*px,cw*px,ch*px);};
-  cell(3,20,6,4,shadow); cell(4,3,4,1,glass); cell(3,4,6,1,glass);
+  cell(3,20,6,4,shadow);
+  cell(4,3,4,1,glass); cell(3,4,6,1,glass);
   for(let yy=5;yy<=19;yy++) cell(3,yy,6,1,glass);
   for(let yy=1;yy<=2;yy++) cell(5,yy,2,1,glass);
   cell(4,0,4,2,labelColor);
-  for(let yy=5;yy<=19;yy++){cell(3,yy,1,1,shadow);cell(8,yy,1,1,shadow);}
+  for(let yy=5;yy<=19;yy++){cell(3,yy,1,1,shadow);cell(8,yy,1,1,shadow);} 
   cell(4,3,1,1,shadow); cell(7,3,1,1,shadow);
-  cell(3,10,6,8,labelColor);
-  cell(4,8,1,3,'#cfe8ff');
+  cell(3,10,6,8,labelColor); cell(4,8,1,3,'#cfe8ff');
 }
-function spawnSpike(){
-  const palette=['#FFB511','#AC6F42','#00BA6E','#5B8EDB','#F16AB7','#FF6C2F','#E74536','#936DB7'];
-  const h=Math.round(rand(144,224)*0.72), w=Math.round(h*0.6);
-  const color=palette[Math.floor(Math.random()*palette.length)];
-  spikes.push({x:canvas.width+w,y:GROUND_Y+(player.h-h),w,h,labelColor:color});
+
+/* ===== Fût ===== */
+function drawKegSprite(ctx,x,bottomY,w,h,style='inox'){
+  const left=Math.round(x), top=Math.round(bottomY-h);
+  const rimH=Math.max(4,Math.round(h*0.10)), slotH=Math.max(2,Math.round(h*0.08)), slotW=Math.max(8,Math.round(w*0.45));
+  let body='#c9d1da', rim='#b3bdc8', line='#9aa6b3', shadow='rgba(0,0,0,0.1)';
+  if(style==='inoxBands'){rim='#1b2230'; shadow='rgba(0,0,0,0.12)';}
+  ctx.fillStyle=body; ctx.fillRect(left,top,w,h);
+  ctx.fillStyle=rim; ctx.fillRect(left,top,w,rimH); ctx.fillRect(left,top+h-rimH,w,rimH);
+  ctx.fillStyle=line; ctx.fillRect(left,top+Math.round(h*0.33),w,2); ctx.fillRect(left,top+Math.round(h*0.66),w,2);
+  ctx.clearRect(left+Math.round((w-slotW)/2), top+Math.round(rimH*0.6), slotW, slotH);
+  ctx.fillStyle=shadow; ctx.fillRect(left+w-Math.max(2,Math.round(w*0.06)), top+rimH, Math.max(2,Math.round(w*0.06)), h-rimH*2);
 }
-function spawnGrass(x){ const w=Math.round(rand(20,50)), h=Math.round(rand(10,30)); grasses.push({x:(typeof x==='number')?x:canvas.width+w, baseY:GROUND_Y+player.h, w, h}); }
+
+/* ===== Herbe ===== */
+function spawnGrass(x){
+  const w = Math.round(rand(20, 50));
+  const h = Math.round(rand(GRASS_H_MIN, GRASS_H_MAX));
+  grasses.push({ x: (typeof x === 'number') ? x : LOGICAL_W + w, baseY: GROUND_Y + player.h + GRASS_Y_OFFSET, w, h });
+}
 function drawGrassSprite(ctx,x,baseY,w,h){
-  const gx=Math.max(1,Math.floor(w/6)), gh=Math.max(1,Math.floor(h/6)), y=Math.round(baseY), left=Math.round(x);
+  const gx=Math.max(1,Math.floor(w/6)), gh=Math.max(1,Math.floor(h/6));
+  const y=Math.round(baseY), left=Math.round(x);
   const a='#2e7d32', b='#66bb6a';
   ctx.fillStyle=a; ctx.fillRect(left,y-h,gx*2,h);
   ctx.fillStyle=b; ctx.fillRect(left+gx*2,y-Math.round(h*.8),gx*2,Math.round(h*.8));
@@ -238,179 +299,305 @@ function drawGrassSprite(ctx,x,baseY,w,h){
   ctx.fillRect(left+gx*5,y-Math.round(h*.9)-gh,gx,gh);
 }
 
-/* ===== START OVERLAY (bouton neo-2D) ===== */
-const startBtn = {x:0,y:0,w:0,h:0, visible:false};
+/* ===== Capsule ===== */
+function drawCapDisk(ctx, r, color, angle){
+  ctx.save(); ctx.rotate(angle);
+  ctx.beginPath(); ctx.arc(0,0,r,0,Math.PI*2); ctx.fillStyle=color; ctx.fill();
+  const teeth=18, len=Math.max(4,Math.round(r*0.28));
+  for(let i=0;i<teeth;i++){
+    const a=(i/teeth)*Math.PI*2, x1=(r-2)*Math.cos(a), y1=(r-2)*Math.sin(a);
+    const x2=(r+len)*Math.cos(a+0.08), y2=(r+len)*Math.sin(a+0.08);
+    const x3=(r+len)*Math.cos(a-0.08), y3=(r+len)*Math.sin(a-0.08);
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.lineTo(x3,y3); ctx.closePath(); ctx.fillStyle=color; ctx.fill();
+  }
+  ctx.globalAlpha=.18; ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(-r*.25,-r*.25,r*.55,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+/* ===== Spawns ===== */
+function spawnSpike(){
+  const useKeg = (world.runTime >= KEG_AFTER_SECONDS) && (Math.random() < KEG_PROBABILITY);
+  if (!useKeg){
+    let h = Math.round(rand(144,224) * 0.72);
+    h = Math.round(h * 0.80);
+    const w = Math.round(h * 0.6);
+    const color = LABEL_PALETTE[Math.floor(Math.random()*LABEL_PALETTE.length)];
+    spikes.push({ kind:'bottle', x:LOGICAL_W+w, y:GROUND_Y+(player.h-h), w, h, labelColor:color });
+    resetObstacleDistance('bottle');
+  } else {
+    let h = Math.round(rand(190,260)); h = Math.round(h * 0.85);
+    let w = Math.round(h * 0.72); w = Math.round(w * 0.85);
+    const style = ['inox','inoxBands'][Math.floor(Math.random()*2)];
+    spikes.push({ kind:'keg', x:LOGICAL_W+w, y:GROUND_Y+(player.h-h), w, h, style });
+    resetObstacleDistance('keg');
+  }
+}
+
+function spawnCapFlyer(){
+  const baseY = GROUND_Y + player.h - rand(FLY_ALT_MIN, FLY_ALT_MAX);
+  const r = Math.round(rand(CAP_RADIUS_MIN, CAP_RADIUS_MAX));
+  flyers.push({
+    x: LOGICAL_W + 60,
+    yBase: baseY,
+    r,
+    amp: rand(CAP_AMP_RANGE[0], CAP_AMP_RANGE[1]),
+    omega: rand(CAP_OMEGA_RANGE[0], CAP_OMEGA_RANGE[1]),
+    t: 0,
+    angle: rand(0,Math.PI*2),
+    omegaSpin: rand(CAP_SPIN_RANGE[0], CAP_SPIN_RANGE[1]),
+    vx: SPEED_BASE * rand(CAP_VX_FACTOR[0], CAP_VX_FACTOR[1]),
+    color: LABEL_PALETTE[Math.floor(Math.random()*LABEL_PALETTE.length)]
+  });
+}
+
+/* ===== START OVERLAY ===== */
+const startBtn={x:0,y:0,w:0,h:0,visible:false};
 function drawStartOverlay(){
-  c.save();
-  c.fillStyle='rgba(0,0,0,0.25)';
-  c.fillRect(0,0,canvas.width,canvas.height);
-
-  const btnW = Math.min(520, Math.floor(canvas.width*0.75));
-  const btnH = 180;
-  const btnX = Math.floor((canvas.width - btnW)/2);
-  const btnY = Math.floor((canvas.height - btnH)/2);
+  c.save(); c.fillStyle='rgba(0,0,0,0.25)'; c.fillRect(0,0,LOGICAL_W,LOGICAL_H);
+  const btnW=Math.min(520,Math.floor(LOGICAL_W*.75)), btnH=180;
+  const btnX=Math.floor((LOGICAL_W-btnW)/2), btnY=Math.floor((LOGICAL_H-btnH)/2);
   startBtn.x=btnX; startBtn.y=btnY; startBtn.w=btnW; startBtn.h=btnH; startBtn.visible=true;
-
   c.fillStyle='rgba(0,0,0,0.35)'; c.fillRect(btnX+8,btnY+10,btnW,btnH);
   c.fillStyle='#E5CFC0'; c.fillRect(btnX,btnY,btnW,btnH);
   c.fillStyle='rgba(255,255,255,0.55)'; c.fillRect(btnX,btnY,btnW,6); c.fillRect(btnX,btnY,6,btnH);
-  c.fillStyle='rgba(0,0,0,0.25)';      c.fillRect(btnX,btnY+btnH-6,btnW,6); c.fillRect(btnX+btnW-6,btnY,6,btnH);
-
-  const line1='PLAY WITH US';
-  const line2="BRASSERIE DOCTEUR GAB'S";
-  const S=4;
-  const ty = btnY + Math.floor((btnH - (7*S + 10 + 22)) / 2);
-  const tx1 = btnX + Math.floor((btnW - textW(line1,S)) / 2);
-  pixText(c, line1, tx1, ty, S, '#000');
-
-  c.font='bold 22px system-ui, sans-serif';
-  c.fillStyle='#000'; c.textAlign='center';
-  c.fillText(line2, btnX + btnW/2, ty + 7*S + 20);
-
-  c.font='italic 16px system-ui, sans-serif';
-  c.fillText('Espace / clic pour jouer', canvas.width/2, btnY+btnH+14);
-  c.restore();
+  c.fillStyle='rgba(0,0,0,0.25)'; c.fillRect(btnX,btnY+btnH-6,btnW,6); c.fillRect(btnX+btnW-6,btnY,6,btnH);
+  const line1='PLAY WITH US', line2="BRASSERIE DOCTEUR GAB'S", S=4;
+  const ty=btnY+Math.floor((btnH-(7*S+10+22))/2), tx1=btnX+Math.floor((btnW-textW(line1,S))/2);
+  pixText(c,line1,tx1,ty,S,'#000'); c.font='bold 22px system-ui, sans-serif'; c.fillStyle='#000'; c.textAlign='center';
+  c.fillText(line2,btnX+btnW/2,ty+7*S+20); c.font='italic 16px system-ui, sans-serif';
+  c.fillText('Espace / clic pour jouer', LOGICAL_W/2, btnY+btnH+14); c.restore();
 }
 
-/* ===== Input ===== */
+/* ===== Audio minimal ===== */
+let AudioCtx=null, jumpSnd=null, hitSnd=null;
+function initAudio(){ if(world.muted) return; if(AudioCtx) return; AudioCtx = window.AudioContext? new AudioContext():null; if(!AudioCtx) return; 
+  function beep(freq=600, dur=0.06, type='sine', gain=0.05){ const ctx=AudioCtx; const o=ctx.createOscillator(); const g=ctx.createGain(); o.type=type; o.frequency.value=freq; g.gain.value=gain; o.connect(g); g.connect(ctx.destination); o.start(); o.stop(ctx.currentTime+dur);} 
+  jumpSnd=()=>beep(740,0.07,'square',0.04); hitSnd=()=>beep(140,0.12,'sawtooth',0.06);
+}
+
+/* ===== Input + fonctions du saut ===== */
 function startGame(){
-  if (world.phase==='play') return;
-  world.phase='play';
-  world.playing=true;
-  world.runTime=0;
-  world.speedFactor=0.5;
-  world.score=0;
-  // >>> reset avec offset
-  player.y = GROUND_Y + PLAYER_Y_OFFSET; player.vy=0; player.grounded=true;
-  spikes.length=0; grasses.length=0;
-  resetObstacleDistance(); resetGrassDistance();
+  if(world.phase==='play') return;
+  world.phase='play'; world.playing=true; world.paused=false; world.runTime=0; world.speedFactor=0.5; world.score=0;
+  player.y=GROUND_Y+PLAYER_Y_OFFSET; player.vy=0; player.grounded=true;
+  spikes.length=0; grasses.length=0; flyers.length=0;
+  resetObstacleDistance('bottle'); resetGrassDistance(); resetFlyDistance();
+  jumpHeld=false; jumpHoldT=0; jumpsUsed=0; coyoteT=0; jumpBufferT=0;
+  updateAriaHud();
 }
+
 function doJump(){
   if(world.phase!=='play'){ startGame(); return; }
-  if(player.grounded){ player.vy=-JUMP_V; player.grounded=false; }
+  if (jumpsUsed < MAX_JUMPS){
+    const v = (jumpsUsed === 0) ? JUMP_V : JUMP_V2;
+    player.vy = -v;
+    player.grounded = false;
+    jumpHeld = true;
+    jumpHoldT = 0;
+    jumpsUsed++;
+    if(jumpSnd) jumpSnd();
+  } else {
+    // si on a appuyé trop tôt pour le 1er saut, bufferiser (n'affecte pas le 2e)
+    if (jumpsUsed === 0) jumpBufferT = JUMP_BUFFER;
+  }
 }
-window.addEventListener('keydown',e=>{
+function releaseJump(){ jumpHeld=false; }
+
+function togglePause(){
+  if(world.phase!=='play') return;
+  world.paused = !world.paused;
+}
+function toggleMute(){
+  world.muted = !world.muted;
+  if(!world.muted) initAudio();
+  document.getElementById('muteBtn').textContent = world.muted ? '🔇 Son (M)' : '🔊 Son (M)';
+}
+
+/* ===== Listeners ===== */
+window.addEventListener('keydown',e=>{ 
   if(e.code==='Space'){ e.preventDefault(); doJump(); }
   if(e.key.toLowerCase()==='r'){ startGame(); }
+  if(e.key.toLowerCase()==='p'){ togglePause(); }
+  if(e.key.toLowerCase()==='m'){ toggleMute(); }
 });
+window.addEventListener('keyup',e=>{ if(e.code==='Space') releaseJump(); });
+
 document.getElementById('restart').addEventListener('click', startGame);
-document.getElementById('toggleTheme').addEventListener('click',()=>{
-  theme=(theme==='day')?'night':'day';
-  mid.reset();
-});
-canvas.addEventListener('pointerdown',(e)=>{
+document.getElementById('toggleTheme').addEventListener('click',()=>{ theme=(theme==='day')?'night':'day'; mid.reset(); field.reset(); });
+document.getElementById('pauseBtn').addEventListener('click', togglePause);
+document.getElementById('muteBtn').addEventListener('click', toggleMute);
+
+canvas.addEventListener('pointerdown',e=>{
   const rect=canvas.getBoundingClientRect();
-  const x=(e.clientX-rect.left)*(canvas.width/rect.width);
-  const y=(e.clientY-rect.top )*(canvas.height/rect.height);
+  const x=(e.clientX-rect.left)*(LOGICAL_W/rect.width);
+  const y=(e.clientY-rect.top )*(LOGICAL_H/rect.height);
   if(world.phase!=='play'){
     if(startBtn.visible && x>=startBtn.x && x<=startBtn.x+startBtn.w && y>=startBtn.y && y<=startBtn.y+startBtn.h){ startGame(); return; }
     startGame(); return;
   }
   doJump();
 });
+window.addEventListener('pointerup', releaseJump);
+window.addEventListener('pointercancel', releaseJump);
 
-/* ===== Helper pour régler en live depuis la console ===== */
-function setPlayerYOffset(px){
-  PLAYER_Y_OFFSET = px|0;
-  if (player.grounded) player.y = GROUND_Y + PLAYER_Y_OFFSET;
-}
+// Empêcher le scroll sur espace quand canvas a le focus
+canvas.addEventListener('keydown', (e)=>{ if(e.code==='Space'){ e.preventDefault(); }});
 
-/* ===== Reset utilitaire ===== */
-function reset(){
-  world.phase='play'; world.playing=true; world.score=0;
-  // >>> reset avec offset
-  player.y = GROUND_Y + PLAYER_Y_OFFSET; player.vy=0; player.grounded=true;
-  spikes.length=0; grasses.length=0; world.bgFarX=0; world.bgNearX=0;
-  world.speedFactor=0.5; world.runTime=0; world.endMessage='Fail with us';
-  resetObstacleDistance(); resetGrassDistance();
-  for(let i=0;i<6;i++) spawnGrass(rand(0,canvas.width));
-  mid.reset();
-}
+// Pause auto si onglet masqué
+document.addEventListener('visibilitychange',()=>{ if(document.hidden) world.paused = true; });
 
 /* ===== Boucle ===== */
 requestAnimationFrame(loop);
-function loop(ts){ const dt=Math.min(0.033,(ts-last)/1000||0); last=ts; update(dt); draw(); requestAnimationFrame(loop); }
-
-/* ===== Update/Draw ===== */
-function update(dt){
-  if (world.phase!=='play' || !world.playing) return;
-
-  // Accélération linéaire 0.5x -> 2.0x en ~75s
-  world.runTime += dt;
-  const RAMP_DURATION=75, START=0.5, END=2.0;
-  const t = Math.min(world.runTime / RAMP_DURATION, 1);
-  world.speedFactor = START + (END-START)*t;
-
-  const speed = SPEED_BASE * world.speedFactor;
-  const W=canvas.width;
-  world.bgFarX  = (world.bgFarX  - speed*.06 *dt) % W;
-  world.bgNearX = (world.bgNearX - speed*.12 *dt) % W;
-  mid.update(dt, speed*0.8);
-
-  // Physique joueur (avec sol à GROUND_Y + offset)
-  player.vy+=G*dt; player.y+=player.vy*dt;
-  if(player.y>=GROUND_Y + PLAYER_Y_OFFSET){
-    player.y = GROUND_Y + PLAYER_Y_OFFSET;
-    player.vy=0; player.grounded=true;
-  }
-
-  // Spawn par distance
-  world.distToNextObstacle -= speed * dt;
-  if (world.distToNextObstacle <= 0){ spawnSpike(); resetObstacleDistance(); }
-
-  const grassSpeed = speed*1.15;
-  world.distToNextGrass -= grassSpeed * dt;
-  if (world.distToNextGrass <= 0){ spawnGrass(); resetGrassDistance(); }
-
-  // Déplacements & scoring
-  for(let i=spikes.length-1;i>=0;i--){ const s=spikes[i]; s.x-=speed*dt; if(s.x+s.w<0){ spikes.splice(i,1); world.score++; } }
-  for(let i=grasses.length-1;i>=0;i--){ const g=grasses[i]; g.x-=grassSpeed*dt; if(g.x+g.w<0) grasses.splice(i,1); }
-
-  // Collisions
-  for(const s of spikes){
-    if(collidePlayerBottle(s)){
-      world.playing=false;
-      world.phase='gameover';
-      world.best=Math.max(world.best,world.score);
-      localStorage.setItem('bestScore',world.best);
-      world.endMessage = END_PHRASES[Math.floor(Math.random()*END_PHRASES.length)];
-      break;
-    }
-  }
+function loop(ts){ 
+  const dtRaw=(ts-last)/1000||0; last=ts; 
+  const dt=Math.min(0.033, Math.max(0, dtRaw));
+  if(world.phase==='play' && world.playing && !world.paused) update(dt);
+  draw(); 
+  requestAnimationFrame(loop); 
 }
 
+/* ===== Update ===== */
+function update(dt){
+  world.runTime+=dt;
+  const RAMP=125, START=0.5, END=2.0;
+  world.speedFactor = START + (END-START)*Math.min(world.runTime/RAMP,1);
+  const speed = SPEED_BASE*world.speedFactor;
+
+  // Parallax
+  const W=LOGICAL_W;
+  world.bgFarX=(world.bgFarX-speed*.06*dt)%W;
+  world.bgNearX=(world.bgNearX-speed*.12*dt)%W;
+
+  // Field puis guirlandes
+  field.update(dt, speed*0.8);
+  mid.update(dt, speed);
+
+  // Physique saut
+  if(player.grounded){ coyoteT = COYOTE_TIME; jumpBufferT = Math.max(0, jumpBufferT - dt); }
+  else { coyoteT = Math.max(0, coyoteT - dt); jumpBufferT = Math.max(0, jumpBufferT - dt); }
+
+  // Buffer: si on a appuyé récemment et qu'on redevient éligible au 1er saut
+  if (jumpBufferT>0 && jumpsUsed === 0 && (player.grounded || coyoteT>0)){
+    player.vy = -JUMP_V; player.grounded = false; jumpHeld = true; jumpHoldT = 0; jumpsUsed = 1; jumpBufferT = 0; if(jumpSnd) jumpSnd();
+  }
+
+  player.vy += (player.vy < 0 ? G_ASCEND : G_DESCEND) * dt;
+  if (player.vy > VY_FALL_CAP) player.vy = VY_FALL_CAP;
+
+  if (jumpHeld && !player.grounded && jumpHoldT < JUMP_HOLD_MAX){ player.vy -= JUMP_HOLD_ACCEL * dt; jumpHoldT += dt; }
+  if (player.vy >= 0) jumpHeld = false;
+
+  player.y += player.vy * dt;
+
+  if(player.y >= GROUND_Y + PLAYER_Y_OFFSET){
+    player.y = GROUND_Y + PLAYER_Y_OFFSET;
+    player.vy = 0; player.grounded = true;
+    jumpsUsed = 0;
+  } else { player.grounded = false; }
+
+  // Obstacles sol
+  world.distToNextObstacle -= speed * dt;
+  if (world.distToNextObstacle <= 0){ spawnSpike(); }
+
+  // Herbe
+  const grassSpeed = speed * 1.15;
+  world.distToNextGrass -= grassSpeed * dt;
+  if(world.distToNextGrass <= 0){ spawnGrass(); resetGrassDistance(); }
+  for (let i=grasses.length-1;i>=0;i--){ const g = grasses[i]; g.x -= grassSpeed * dt; if (g.x + g.w < -20) grasses.splice(i,1); }
+
+  // Capsules
+  if(world.runTime >= FLY_AFTER_SECONDS){
+    world.distToNextFly -= speed * dt;
+    if(world.distToNextFly <= 0){ spawnCapFlyer(); resetFlyDistance(); }
+  }
+
+  // Déplacement obstacles + score
+  for(let i=spikes.length-1;i>=0;i--){ const s=spikes[i]; s.x -= speed*dt; if(s.x+s.w<0){ spikes.splice(i,1); world.score++; updateAriaHud(); } }
+
+  // Capsules (cos + rotation) + collisions
+  for (let i=flyers.length-1;i>=0;i--){
+    const f=flyers[i];
+    f.t += dt; f.angle += f.omegaSpin * dt; f.x -= f.vx * dt;
+    const yArc = f.yBase + f.amp * (1 - Math.cos(f.omega * f.t));
+    const cx=f.x, cy=yArc, r=f.r;
+
+    // collision: cercle (capsule) vs hitbox "bol" du joueur
+    const hb = PLAYER_AIR_HITBOX;
+    const rx = player.x + player.w * hb.x;
+    const ry = player.y + player.h * hb.y;
+    const rw = player.w * hb.w;
+    const rh = player.h * hb.h;
+    if (circleRectOverlap(cx, cy, r * hb.capShrink, rx, ry, rw, rh)) { onHit(); break; }
+
+    if (cx + r < -100 || cy - r > LOGICAL_H + 60) flyers.splice(i,1); else f.yDraw = yArc;
+  }
+
+  // Collisions sol
+  for(const s of spikes){ if(s.kind==='keg'){ if(collidePlayerKeg(s)){ onHit(); break; } } else { if(collidePlayerBottle(s)){ onHit(); break; } } }
+}
+
+function onHit(){
+  world.playing=false; world.phase='gameover';
+  world.best=Math.max(world.best,world.score); localStorage.setItem('bestScore',world.best);
+  const END=['Fail with us','Lose with us','Crash with us','Fall with us','Stay with us','Last with us'];
+  world.endMessage = END[Math.floor(Math.random()*END.length)];
+  if(hitSnd) hitSnd();
+  updateAriaHud();
+}
+
+/* ===== Draw ===== */
 function draw(){
-  c.clearRect(0,0,canvas.width,canvas.height);
+  c.setTransform(dpr,0,0,dpr,0,0);
+  c.clearRect(0,0,LOGICAL_W,LOGICAL_H);
 
   const bg=(theme==='day')?DAY:NIGHT;
   if(bg.complete&&bg.naturalWidth>0){ drawLayer(bg,world.bgFarX); drawLayer(bg,world.bgNearX); }
-  else { c.fillStyle='#0f141d'; c.fillRect(0,0,canvas.width,canvas.height); }
+  else { c.fillStyle='#0f141d'; c.fillRect(0,0,LOGICAL_W,LOGICAL_H); }
 
+  field.draw(c);
   mid.draw(c);
-  c.fillStyle='#1e2836'; c.fillRect(0,GROUND_Y+player.h,canvas.width,999);
-  c.fillStyle='#2a3649'; c.fillRect(0,GROUND_Y+player.h,canvas.width,6);
+
+  c.fillStyle='#1e2836'; c.fillRect(0,GROUND_Y+player.h,LOGICAL_W,999);
+  c.fillStyle='#2a3649'; c.fillRect(0,GROUND_Y+player.h,LOGICAL_W,6);
 
   drawLogo(); drawPlayer();
-  for(const s of spikes) drawBottleSprite(c,s.x,s.y+s.h,s.w,s.h,s.labelColor);
-  for(const g of grasses) drawGrassSprite(c,g.x,g.baseY,g.w,g.h);
-  c.font='20px system-ui,sans-serif'; c.textBaseline='top'; c.fillStyle='rgba(255,255,255,.9)';
-  c.fillText(`Score: ${world.score}`,20,16); c.fillText(`Best: ${world.best}`,20,42);
 
-  if (world.phase==='start'){ drawStartOverlay(); return; }
-  if (world.phase==='gameover'){
-    c.save();
-    c.fillStyle='rgba(0,0,0,0.45)'; c.fillRect(0,0,canvas.width,canvas.height);
-    const title = world.endMessage, color = '#E5CFC0', fs = Math.floor(canvas.width*0.09);
+  for(const s of spikes){ if(s.kind==='keg') drawKegSprite(c,s.x,s.y+s.h,s.w,s.h,s.style); else drawBottleSprite(c,s.x,s.y+s.h,s.w,s.h,s.labelColor); }
+
+  for(const f of flyers){ c.save(); c.translate(f.x, f.yDraw ?? f.yBase); drawCapDisk(c, f.r, f.color, f.angle); c.restore(); }
+
+  for(const g of grasses) drawGrassSprite(c,g.x,g.baseY,g.w,g.h);
+
+  const hudColor = (theme === 'day') ? 'rgba(0,0,0,.9)' : 'rgba(255,255,255,.9)';
+  c.font='20px system-ui,sans-serif'; c.textBaseline='top'; c.fillStyle=hudColor;
+  c.fillText(`Score: ${world.score}`,20,16); c.fillText(`Best: ${world.best}`,20,42);
+  if(world.phase==='play' && world.paused){ c.font='bold 32px system-ui,sans-serif'; c.textAlign='center'; c.fillText('PAUSE', LOGICAL_W/2, 16); c.textAlign='start'; }
+
+  if(world.phase==='start'){ drawStartOverlay(); return; }
+  if(world.phase==='gameover'){
+    c.save(); c.fillStyle='rgba(0,0,0,0.45)'; c.fillRect(0,0,LOGICAL_W,LOGICAL_H);
+    const title=world.endMessage, color='#E5CFC0', fs=Math.floor(LOGICAL_W*0.09);
     c.textAlign='center'; c.textBaseline='middle';
     c.font=`800 ${fs}px system-ui, sans-serif`;
-    c.fillStyle='rgba(0,0,0,.6)'; c.fillText(title, canvas.width/2, canvas.height/2 - fs*0.1 + 4);
-    c.fillStyle=color; c.fillText(title, canvas.width/2, canvas.height/2 - fs*0.1);
+    c.fillStyle='rgba(0,0,0,.6)'; c.fillText(title,LOGICAL_W/2,LOGICAL_H/2 - fs*0.1 + 4);
+    c.fillStyle=color;             c.fillText(title,LOGICAL_W/2,LOGICAL_H/2 - fs*0.1);
+
+    c.font=`600 ${Math.floor(fs*0.28)}px system-ui, sans-serif`;
+    c.fillStyle=color;
+    c.fillText(`Score: ${world.score}  •  Best: ${world.best}`, LOGICAL_W/2, LOGICAL_H/2 + fs*0.10);
+
     c.font=`500 ${Math.floor(fs*0.35)}px system-ui, sans-serif`;
     c.fillStyle='rgba(255,255,255,.9)';
-    c.fillText('Espace / clic pour rejouer · R pour relancer', canvas.width/2, canvas.height/2 + fs*0.6);
+    c.fillText('Espace / clic pour rejouer · R pour relancer', LOGICAL_W/2, LOGICAL_H/2 + fs*0.6);
     c.restore();
   }
 }
+
+/* ===== Accessibilité (SR) ===== */
+const ariaHud = document.getElementById('ariaHud');
+function updateAriaHud(){ ariaHud.textContent = `Score ${world.score}. Record ${world.best}. ${world.phase==='gameover'?'Partie terminée.':''}`; }
+
+window.addEventListener('load', ()=>{ canvas.focus(); if(!world.muted) initAudio(); });
 </script>
 </body>
 </html>
