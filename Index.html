@@ -470,7 +470,7 @@ function update(dt){
 
   // Field puis guirlandes
   field.update(dt, speed*0.8);
-  mid.update(dt, speed);
+  mid.update(dt, speed*0.9);
 
   // Physique saut
   if(player.grounded){ coyoteT = COYOTE_TIME; jumpBufferT = Math.max(0, jumpBufferT - dt); }
